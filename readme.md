@@ -421,7 +421,7 @@ copy from LLama :
 - What is ff_dim? Do multi_head dims always sum to model_dim?
 - How many vocab elements?
 
-### Stability tricks
+### 
 
 #### Pre or Post norm (ResNorm and non-ResNorm)
 
@@ -563,6 +563,906 @@ vocabulary size 词表大小
 Weight decay不仅仅是normalize 手段 , 还会和optimizer 交互 , 使得optimization更好 ; 因此
 Weight decay实际上是一种 optimization intervention ,not only normalization intervention ; 证据如下图所示
 ![image-20260508215848722](./readme.assets/image-20260508215848722.png)
+
+### Stability tricks
+
+模型训练时会存在一些loss尖峰 , 这些梯度爆炸或消失的部分会导致训练失败 , 我们需要更稳定的训练方式
+![image-20260509104631365](./readme.assets/image-20260509104631365.png)
+
+##### softmax
+
+softmax有指数运算 , 而且要做除法运算 , 这二者都很容易产生梯度爆炸
+softmax出现在output layer 归一化和norm layer
+
+![image-20260509105600695](./readme.assets/image-20260509105600695.png)
+
+softmax 交叉熵计算中，输出分布具有平移不变性：即使所有的 logits $U_r(x)$ 同时加上一个极大的任意常数，最终计算出的概率 $P(x)$ 依然保持不变 ; 这会导致在网络优化过程中，模型倾向于不受约束地不断推高 logits 的绝对幅值。当 logits 的数值过大时，极易在 FP16 或 BF16 等低精度浮点计算中引发 LogSumExp 操作的数值溢出（Overflow），进而导致梯度爆炸或整体训练崩溃（Loss Spike）
+
+通过为loss部分添加归一化项$-log^2z$  , 来约束Z(x)尽可能小  , 最终$\sum e^{U} \approx 1$
+
+这个z loss在业界常见且友好
+
+#### attention
+
+##### Layer norm and pose embedding
+
+![image-20260509112135292](./readme.assets/image-20260509112135292.png)
+
+QK Norm 专门针对的是**注意力机制（Attention）中的 Softmax 层** , 强制将其方差拉回到 1 附近，从而为注意力机制提供了一个极度稳定的训练环境。
+
+
+
+利用 $\tanh$（双曲正切）函数对 Logits 进行非线性压缩。当输入的 logits 数值较小时，$\tanh(x) \approx x$ , 输入 logits 绝对值极大时 , 最终的输出值会被严格限制在 $[-\text{soft\_cap}, +\text{soft\_cap}]$ 的绝对区间 ; 但这些norm也会带来一些性能损失 , 下面的表有对比几种约束带来的效果
+![image-20260509112747019](./readme.assets/image-20260509112747019.png)
+
+
+
+在训练和prefill 阶段 , **otal arithmetic operations (总浮点运算量/FLOPs)**：量级为 $O(bnd^2)$。这主要来自于 $Q, K, V$ 的线性变换以及最后的输出投影矩阵乘法。
+
+**Total memory accesses (总显存访问量/Bytes)**：量级为 $O(bnd + bhn^2 + d^2)$。这包括了读取输入/写入输出的激活值（$bnd$）、读写 $n \times n$ 的注意力矩阵（$bhn^2$）以及加载模型权重（$d^2$）。
+
+算术强度 = **计算量 / 访存量**=$$ O\left(\left(\frac{1}{k} + \frac{1}{bn}\right)^{-1}\right) $$  ,当bn相当大时 ,算术强度趋近于O(k), 此时为计算密集 , 计算效率高
+但是在推理阶段( Decoding) , 一次只能生成一个token(n=1) , 为了计算一个 Token，GPU 都必须把过去所有 Token 的 KV Cache（总显存占用与注意力头数 $h$ 成正比）从 HBM 显存中全部搬运一次 , 此时模型从compute-bound变成了memory-bound 
+因此MQA ,GQA等减少KVcache的模型架构诞生是很自然的![image-20260509113512238](./readme.assets/image-20260509113512238.png)
+
+标准multi-head attention ,GQA和MQA 对比![image-20260509114321887](./readme.assets/image-20260509114321887.png)
+
+GQA算是MQA和MHA的折中 , 取适当的G值可以在模型性能损失较小的同时获得更高的推理速度![image-20260509114422956](./readme.assets/image-20260509114422956.png)
+
+对于O(n^2)的标准attention ,可以使用 **3:1 的交替策略**。即每 3 层 **SWA（Sliding Window Attention，滑动窗口注意力）** 之后，接 1 层 **Full Attention（全局注意力）** SWA时间复杂度为O(n) ; 每 4 层插入一次的full attention则作为“信息枢纽”，负责将局部窗口内的信息进行全局路由和交互![image-20260509151700579](./readme.assets/image-20260509151700579.png)
+
+**短程信息 (SWA 层 + RoPE)**：在 **SWA 局部窗口层**，模型使用了标准的 **RoPE（旋转位置编码）**。这使得模型能够极其敏锐地捕捉 token 之间的细粒度、高频的局部相对位置关系（例如句法结构、相邻词汇搭配）。
+
+**长程信息 (Full 层 + NoPE)**：在全局注意力层，模型直接**丢弃了位置编码（NoPE，No Positional Embeddings）**。因为高频的局部相对位置已经在 SWA 层被处理并融合到了特征表征中。在全局层去掉 RoPE，可以有效规避传统位置编码在面对超长、未见过的序列长度时所产生的长度外推（Length Extrapolation）灾难，纯粹依靠特征本身的语义相似度来进行全局 Attention 聚合。
+
+##### liner attention 线性注意力
+
+$$ \text{Attention}(Q, K, V) = \text{softmax}\left( \frac{QK^T}{\sqrt{d_k}} \right) V $$ $ Q\in R^{n\times d_{k}},K\in\mathbb{R}^{n\times d_{k}},V\in\mathbb{R}^{n\times d_{k}}$  计算量为$$O( n^2 d_k + n^2 d_v )$$
+而如果我们能**用一个线性函数代替softmax** , 则此时可以满足乘法交换律 , 即$$ (QK^T)V = Q(K^T V) $$ 此时计算量为$O(2 n d_v d_k) $ ,一般而言n远大于d_k和d_v , 因此这样子可以节省大量的计算 ,把Attention计算量从$O(N^2)$变成了O(N)
+
+这样子的结构有点类似RNN , RNN在推理时十分友好 , 但是训练不太好处理 ,
+
+Minimax M1 就使用了这种线性attention , 根据我们上面的描述其实也可以推断 , 并非完全是O(N)的推理计算复杂度 , 但总归是计算量相较于之前的减少了部分 ($n->d_k$)
+
+**线性注意力 (Linear Attention):**
+
+$$S_t = S_{t-1} + k_t v_t^T$$
+
+$$y_t = q_t^T S_t$$
+
+在线性注意力中，隐藏状态 $S_t$ 是通过简单的**无权重累加**来更新的。这意味着历史状态 $S_{t-1}$ 被无差别地保留到了当前时刻，模型缺乏一种机制来“遗忘”不重要的历史信息。这限制了其上下文压缩的表达能力。
+
+**Mamba-2 (泛化后的线性注意力):**
+
+$$S_t = \gamma_t S_{t-1} + k_t v_t^T$$
+
+$$y_t = q_t^T S_t + v_t^T D$$
+
+**核心改进在于红色的 $\gamma_t$ 项。** 幻灯片指出 $\gamma_t = f(x_t)$，即这个衰减系数是**依赖于当前输入**的。
+
+它赋予了模型类似 LSTM 中遗忘门的能力（选择性状态空间，Selective SSM）：模型可以根据当前的输入动态决定是保留还是清除之前的隐藏状态 $S_{t-1}$。正是这个输入依赖的门控机制，极大地增强了 Mamba-2 的特征提取和表达能力（"make linear attention more expressive via gating"） ; 后面的 $+ v_t^T D$ 则可以看作是一种直通项或残差连接。
+
+**推理时（RNN 视角）：** 它可以像上述公式一样，以**串行（Sequential）的方式一步步更新状态** $S_t$，实现 $O(1)$ 的推理显存占用和极高的自回归生成速度。
+
+**训练时（CNN/Attention 视角）：** 尽管引入了依赖输入的 $\gamma_t$，但通过并行前缀和（Parallel Associative Scan）或结构化矩阵乘法等硬件感知算法，依然可以在序列维度上**并行计算**所有的状态更新，避免了传统 RNN 无法并行训练的致命缺点。
+**串行块展示了数据的逻辑流向** , **并行块**将多个独立的线性变换**合并成一个大的并行矩阵乘法** , 从而提高了硬件吞吐量
+
+![image-20260511152713889](./readme.assets/image-20260511152713889.png)
+
+**门控 Delta 网络 (Gated Delta Net)**。
+
+如果说 Mamba-2 的核心贡献是给线性注意力加上了“全局遗忘门”，那么 Gated Delta Net 的核心创新就是引入了“输入门控”**和**“选择性擦除”机制，它能更精准地控制记忆的写入与覆盖。
+
+以下是具体的深度拆解：
+
+1. 核心公式对比：从标量衰减到矩阵投影
+
+对比 Mamba-2 和 Gated Delta Net 的状态更新逻辑：
+
+- **Mamba-2 的更新：**
+
+  $$S_t = \gamma_t S_{t-1} + k_t v_t^T$$
+
+  这里的 $\gamma_t$ 作为一个由当前输入决定的标量，作用在整个隐藏状态矩阵 $S_{t-1}$ 上。这是一种相对粗放的“全局缩放”，它只能决定整体衰减多少，无法针对性地遗忘某部分特定的信息。
+
+- **Gated Delta Net 的更新（基于 Delta 规则）：  **$$S_t = \gamma_t (I - \beta_t k_t k_t^T) S_{t-1} + \beta_t k_t v_t^T$$    这个公式引入了第二个依赖输入的门控标量 $\beta_t = f(x_t)$，并构造了一个极其关键的矩阵乘子 $(I - \beta_t k_t k_t^T)$。
+
+标准 RNN 的状态更新像是在做简单的加法。而 Gated Delta Net 的更新公式$$S_t = S_{t-1} - \beta_t k_t (k_t^T S_{t-1} - v_t^T)$$ 在数学结构上**完全等价于一步梯度下降（Gradient Descent）**
+
+**① 输入门控机制（'no input operation' gate）** 通过标量 $\beta_t$ 来控制新知识的写入。
+
+**② 沿着特定方向选择性擦除（Selective Erasure）**
+
+在线性注意力的累加更新中，状态矩阵 $S_t$ 的容量是有限的，一直累加容易饱和。
+
+- 乘上 $(I - \beta_t k_t k_t^T)$ 这个项，本质上是一个**基于当前查询特征的空间投影**操作。
+- 在向矩阵中写入新的键值对外积 $k_t v_t^T$ 之前，它会先扫描历史记忆 $S_{t-1}$，并把其中**与当前 Key ($k_t$) 方向高度重合/对齐的旧记忆提前抹除掉**。
+- 这赋予了模型一种**精准修改自身记忆**的能力：当它看到一个相同主语的新事实时，它可以洗掉该主语关联的旧事实，再写入新事实，避免了新旧知识在矩阵中的混叠冲突。
+
+这个模式在qwen3.5中也有使用
+
+#### Hybrids attention混合注意力
+
+![image-20260511162642657](./readme.assets/image-20260511162642657.png)
+
+每堆叠 3 层 Gated Delta Net，再交替 1 层标准注意力层
+
+图中展示了这两种不同的 Block 结构，它们都结合了 **MoE (混合专家)** 和 **Zero-Centered RMSNorm**：
+
+- **上半部分（Gated Attention Block）：** 这是保留的传统注意力层。但做了一些优化，比如引入了 Partial RoPE（部分旋转位置编码）和类似于门控机制的 Output Gate。保留一层 Attention 的目的是为了**弥补线性 RNN 在精确全局检索（如大海捞针任务）上的固有劣势**。
+- **下半部分（Gated DeltaNet Block）：** 这正是我们上一张图讨论的内容落地。你可以清晰地看到内部包含了卷积（Conv）处理局部特征，然后计算 $q^\intercal k$，并结合 $\alpha$ 和 $\beta$ 门控，最终执行 **Gated Delta Rule**。这部分取代了大部分的 Attention 层，负责高效的上下文状态压缩。
+
+**原理解析：** 纯 Attention 模型在 Decode 阶段，其 KV Cache 的大小随着序列长度 $O(N)$ 增长，导致极高的显存带宽瓶颈（Memory-bound），解码速度会随上下文变长而显著变慢。
+
+而采用了 3:1 混合架构后，占多数的 GDN 层在推理时将历史信息压缩在了**固定大小的隐状态矩阵**中，不需要读取庞大的 KV Cache。因此，在超长文本生成时，它的速度优势被无限放大。
+
+Hybrid performance
+
+![image-20260511162956328](./readme.assets/image-20260511162956328.png)
+
+混合架构的优劣 : 虚线代表dense架构的标准参考性能 , 右下角可以看出 , 随着线性layer的混合比例增加 , 性能会下降
+但**部分架构在低比例混合下性能下降其实并不明显** ,而这可以大大提高推理性能
+
+#### 稀疏适应（Sparse Adaptation）
+
+不改变底层架构，而是通过“稀疏适应（Sparse Adaptation）” , **与其在计算注意力时“关注所有历史 Token（Dense）”，不如只挑最重要的那几个看（Sparse）。** 这种方法被称为 DSA（动态/解耦稀疏注意力）。
+
+DSA 引入了一个计算**代价极低的“预筛选”**机制。(这个虽然也是$O(N^2)$ , 但是计算量比softmax小得多 , 因此可以节省时间)
+
+- $I_{t,s} = \sum_{j=1}^{H^I} w_{t,j}^I \cdot \text{ReLU}(\mathbf{q}_{t,j}^I \cdot \mathbf{k}_s^I)$ 不计算softmax 而是ReLU , 计算**相关性分数 ($I_{t,s}$)** 极快 , 且精度要求低
+- $\mathbf{u}_t = \text{Attn}(\mathbf{h}_t, \{\mathbf{c}_s | I_{t,s} \in \text{Top-k}(I_{t,:})\})$ 现在只对分数排名前 K (`Top-k`) 的历史 Token 进行计算 ,降低计算量
+
+- **混合架构 (Hybrids)：** 靠换零件（换上线性 RNN 引擎）来提速，适合大厂从头预训练下一代旗舰模型。
+- **稀疏适应 (Sparse Adaptation)：** 靠优化工作流（加个前置筛选器）来提速，是一种极具性价比的“外挂”方案，非常适合现有模型的长文本能力改造。
+
+
+
+通过左下方折线图可以看出 , 随着上下文长度增加 , 推理成本大大降低
+上方柱状图可知稀疏并没有导致性能损失过多
+右下角的图表中 
+
+GLM-4.7 团队在 RULER（一个极其严苛的长文本大海捞针测试集）上的消融实验：
+
+- **GLM-4.7-Flash（基线）：** 传统的密集注意力，128K 时准确率为 79.21%。
+- **+ DSA warmup（仅预热）：** 这就是你提到的“只训练 Indexer，冻结主模型”。可以看到在 128K 时，成绩掉到了 71.35%。这说明如果主干模型完全不适应突然变稀疏的输入，性能还是会有所损耗。
+- **+ DSA（联合训练）：** 在经过 warmup 之后，开放主干网络一起进行联合微调（Jointly trains both for 150B tokens）。此时 128K 的成绩回升到了 **78.86%**。
+
+- ![image-20260511174940425](./readme.assets/image-20260511174940425.png)
+
+##### 解耦训练:
+
+分为两阶段
+
+##### 第一阶段：密集注意力预训练 (Dense Short-context Pretraining)
+
+在这个阶段，模型**完全没有**长文本能力，也没有任何“稀疏（Sparse）”的黑科技。
+
+- **状态：** 一个最标准、最古典的 Transformer 架构。
+- **输入长度：** 限制在极短的窗口（通常是 4K 或 8K Token）。
+- **注意力机制：** 密集注意力（Dense Attention）。即每一个 Token 在计算时，都必须老老实实地和前面所有的 Token 进行 $O(N^2)$ 的全量计算。
+
+如果一开始就用稀疏注意力（只挑几个词看），模型根本学不会人类语言的复杂逻辑、世界法则和代码常识。
+
+
+
+##### 第二阶段：稀疏适应与上下文扩展 (Sparse Adaptation & Context Extension)
+
+
+
+通常会**直接复制主模型中已经训练好的 Query 和 Key 的投影矩阵权重**，作为 Indexer 的初始权重。
+然后将输入上下文拉长（比如拉到 32K），**冻结（Freeze）主模型的所有参数**，确保它的智商不掉。只开放新加的 Indexer 参数进行训练。
+在**后台跑一个极其昂贵的全量 Dense Attention 作为“老师”**，然后让小巧的 Indexer 作为“学生”去预测：“如果老师来看这段 32K 的文本，**它会把注意力集中在哪几个 Token** 上？” Indexer 通过**模仿老师的注意力分布**，迅速掌握了在长文本中“抓重点”的能力。
+
+##### 第三截断：小学习率的联合微调 (Joint Fine-tuning)
+
+- **状态：** 上下文长度拉到最大）。此时，解锁主模型的部分或全部参数。
+- **发生了什么：** 主干模型突然发现，原本输入给它的、极其丰富的全量历史信息（Dense KV Cache）不见了，变成了被 Indexer 过滤后的稀疏信息（Sparse KV Cache）。主模型最初会有些不适应（性能会有微小波动）。
+- **对齐：** 通过极小学习率的联合微调，主模型逐渐学会了如何在这种“信息不完整但绝对精确”的稀疏输入下，继续保持它原有的高智商推理能力。
+
+**使用解耦训练的优点：** 前 99% 的训练数据都在极省显存的 4K 长度下跑完，算力成本是线性的、可控的。**只有在最后不到 1% 的数据（Post-hoc stage）时，才拉长到 128K 进行微调。**
+
+### Mixture of expert MoE
+
+![image-20260511200655575](./readme.assets/image-20260511200655575.png)
+
+如图所示 , MoE 把大的FFN拆成多个小的FFN , 推理时仅使用一个或几个而非全部 , 从而降低计算量提高推理速度
+
+
+
+如图 , 在**相同推理运算量**下 , 随着模型参数的增加 , 
+
+![image-20260511201208395](./readme.assets/image-20260511201208395.png)
+
+##### Switch Transformer
+
+创新：
+
+1. **从 Top-N 变为 Top-1 路由**
+
+2. **优化了专家容量因子（Capacity Factor）：**
+
+   - 在 MoE 中，如果所有 Token 都涌向同一个专家，会导致该专家计算溢出（Token Dropping），而其他专家闲置。传统 MoE 通常需要留出很大的冗余容量（Capacity Factor 较高）。
+   - Switch Transformer 证明了在 Top-1 路由下，即使将 Capacity Factor 降得很低（比如 1.0 或 1.25），依靠辅助负载均衡损失函数（Auxiliary Load Balancing Loss），依然能实现很好的路由均衡。
+
+3. **精度混合训练（Selective Precision）：**
+
+   为了解决稀疏模型难以收敛和不稳定的问题，Switch Transformer 在模型主体使用 BFloat16 甚至更低精度时，强制**将 Router（门控网络）的计算保留在 FP32 精度**，这成为了后来所有大厂训练 MoE 模型的标准操作（Base practice）
+
+Switch Transformer 证明了 **Top-1 是可行且高效的**。
+
+但在今天（2024-2026年），你研究的 Qwen MoE、Mixtral 8x7B 以及 DeepSeek 系列，为了在有限规模下追求极致的性能（Reasoning / Math），往往又回到了 **Top-2 甚至细粒度多专家路由（Fine-grained Expert Routing）** 的思路上。
+
+![image-20260511202903418](./readme.assets/image-20260511202903418.png)
+
+上图体现了MoE天然支持设备级并行 ， 将expert拆开显然很合理 ， 但负载均衡问题该怎么解决呢
+
+1. 辅助负载均衡损失 (Auxiliary Load Balancing Loss) ， 必备
+
+2.  专家容量限制与 Token 丢弃 (Expert Capacity & Token Dropping)
+
+   如果发往 Device 1 的 Token 超过了容量 $C$，多出来的 Token 就直接被**丢弃（Dropped）**——即跳过该专家的 FFN 计算，直接通过残差连接流向下一层。
+
+   虽然丢弃 Token 会轻微损害模型的推理质量，但这反过来构成了巨大的压力，迫使负载均衡损失发挥作用，因为模型为了降低 Loss，必须学会把 Token 分配给没满载的闲置专家。
+
+3. 反向路由：专家选择 Token (Expert Choice Routing)
+
+   这是近年来（如 Google 的部分研究）为了彻底解决硬件浪费提出的一种更优雅的架构。传统 MoE 是“Token 选专家”，很容易扎堆；新的设计改为“专家选 Token”。强制规定每个 Device 上的专家必须挑选出 Top-K 个对自己来说权重最高的 Token。这样在物理层面上，每个 Device 每一轮分配到的计算量是绝对相等的，彻底实现了 0 算力浪费。
+
+![image-20260512100657284](./readme.assets/image-20260512100657284.png)
+
+token choice top-k 相较于expert choice , loss更低
+
+![image-20260512101123118](./readme.assets/image-20260512101123118.png)
+
+##### 哈希函数 hashing
+
+1. 哈希表是均匀散列的 ， 意味着token分布一定是均匀的 ；
+2. 哈希计算的开销约等于零。不需要在反向传播时更新路由器的权重，极大地加快了训练速度 ； 
+3. 因为没有参数，路由规则是写死的。不管模型怎么训练，它不会只训练某一个专家，训练过程会变得稳定。
+
+缺点：使用hashing会导致路由失去意义 ， 所有专家接收的token没有规律 ，expert这个专家不够“专”  ， 因此在相同参数量下的性能会低于learningable  MoE
+
+shared expert : 通用专家 ， MoE中的dense部分 ， apply all the time
+
+![image-20260512102523606](./readme.assets/image-20260512102523606.png)
+如图是deepseek MoE 的实验结论 带有shared expert在大部分数据上效果都更好 ，且更细粒度的切分专家效果也会变好
+
+![image-20260512102652482](./readme.assets/image-20260512102652482.png)Olmo表示有帮助的并非shared expert , 而是**更细粒度的expert切分**
+
+
+
+##### how to train
+
+训练时我们需要**稀疏训练每一个专家** ， 但这种**稀疏决策是不可导**的(路由错了你反向传播也不可能传播到别的expert上) 
+solution
+
+1. RL训练门控路由
+2. 随机扰动（类比 Noisy Top-k ，**将硬性选择变成软性选择** ，近似出可传递的梯度(类似重参数化 , 随机采样不可导的节点用噪声取代) )
+3. **启发式均衡损失**（最常用）
+
+**RL太重**了 ， 性价比很低
+
+Input Jitter 这种**物理加噪**手段效果可以见下表 ， 根据消融实验可知 ， 
+虽然模型不崩溃了，但因为输入被噪声污染了，**性能变差**（相较于baseline）
+
+| Method                   | Fraction Stable | Quality (↑)   |
+| ------------------------ | --------------- | ------------- |
+| Baseline                 | 4/6             | -1.755 ± 0.02 |
+| Input jitter ($10^{-2}$) | 3/3             | -1.777 ± 0.03 |
+| Dropout (0.1)            | 3/3             | -1.822 ± 0.11 |
+
+##### Heuristi Balancing Loss启发式均衡损失
+
+为了强迫模型对专家的训练足够均衡，我们需要在总 Loss 里加一个惩罚项。**但Token 分配（`argmax` 操作）是不可导的，梯度传不过去。**
+
+在一个 Batch（$T$ 个 Token）中，**实际上**有多少比例的 Token 被发给了专家 $i$。$$f_i = \frac{1}{T} \sum_{x \in \mathcal{B}} \mathbb{1} \{\text{argmax } p(x) = i\}$$
+在一个 Batch 中，Router 网络给专家 $i$ 打出的 Softmax 概率 $p_i(x)$ 的平均值。$$P_i = \frac{1}{T} \sum_{x \in \mathcal{B}} p_i(x)$$
+混合点积（**Hybrid Dot-Product**）  $$\text{loss} = \alpha \cdot N \cdot \sum_{i=1}^N f_i \cdot P_i$$ 
+
+可以这么理解 ， 分配越不均匀(单独的expert) ，这个loss越大(虽然不太好直接理解， 但是求梯度的时候可以对softmax均值 做梯度下降 ， 从而优化路由器) 
+
+而且不单只是 repert balance , 这个做法也可以 pre-device balance  , 具体做法区别不大 , 但可以提高训练设备的利用率
+
+![image-20260512151739487](./readme.assets/image-20260512151739487.png)
+
+上图是DeepSeek-V3 在混合专家模型（MoE）中解决负载均衡（Load Balancing）问题的核心策略
+
+1. 核心创新：基于 Expert Bias 的“无辅助损失”路由
+
+幻灯片上半部分的公式展示了 DeepSeek-V3 的主要负载均衡机制：**Per-expert biases**。
+
+$$g'_{i,t} = \begin{cases} s_{i,t}, & s_{i,t} + b_i \in \text{Topk}(\{s_{j,t} + b_j | 1 \le j \le N_r\}, K_r), \\ 0, & \text{otherwise}. \end{cases}$$
+
+**原理解析：**
+
+- $s_{i,t}$ 是门控网络计算出的 token $t$ 对专家 $i$ 的**原始亲和度**（Routing Score）。
+- $b_i$ 是专门为专家 $i$ 设置的**动态偏差项（Bias）**。
+- **Top-K 决策阶段：** 在决定将 token 路由给哪 $K_r$ 个专家时，模型使用的是**加上 Bias 后的分数** ($s_{i,t} + b_i$)。
+- **权重输出阶段：** 一旦专家被选中，最终参与 MoE 加权求和的门控权重 $g'_{i,t}$ **仍然是原始的 $s_{i,t}$**，而不是 $s_{i,t} + b_i$。
+
+**为什么这样设计？**
+
+这就是它被称为“无辅助损失”的原因。它通过**在线学习（Online Learning）动态调整** $b_i$：如果某个专家被分配的 token 太少，$b_i$ 就会增加，人为地将其“抬升”进 Top-K 的队列中；反之则降低。
+
+**关键点在于梯度解耦**：因为最终乘到专家输出上的权重是原始的 $s_{i,t}$，所以在反向传播时，负载均衡的操作（$b_i$ 的调整）**不会产生影响 $s_{i,t}$ 梯度的惩罚项**。门控网络可以纯粹为了降低主任务 Loss 去优化 $s_{i,t}$，而**不用兼顾负载均衡**。
+
+虽然 Bias 机制在大尺度（Batch 级别）上能很好地平衡负载，但对于**极端分布的单条长序列**（例如某段代码或特定语言的超长文本），可能会导致序列内部发生严重的负载失衡。因此，他们引入了一个**补充性的序列级平衡损失**：$$\mathcal{L}_{\text{Bal}} = \alpha \sum_{i=1}^{N_r} f_i P_i $$ 如果一个专家在序列中被频繁选中（$f_i$ 很大），Loss 就会惩罚网络，迫使其降低该专家的输出概率 $P_i$
+
+**主要部分**：使用 **Per-expert bias** 进行全局路由干预，实现主梯度路径与负载平衡的解耦，最大化模型表达能力。
+**兜底：使用一个极小权重 ($\alpha$) 的 **序列级辅助损失**，防止在极端长上下文中发生局部的路由崩溃。
+
+![image-20260512155529928](./readme.assets/image-20260512155529928.png)
+
+块稀疏矩阵乘法 :如果您把所有专家的权重和所有 token 放在一起看，它其实是一个巨大的矩阵乘法。但是，因为一个 **token 只会被路由给特定的 1-2 个专家**，它与**其他所有专家**的乘积结果必然是零。这意味着在这个巨大的运算中，绝大部分区域是“空”的，这就是**稀疏性 (Sparsity)**
+现代MoE训练时 , 利用特殊的 CUDA 内核（Block-sparse GEMM），通过底层的**索引指针**直接告诉 GPU：“这里有一堆大小不一的输入块和对应的专家权重，**请精确地只在非零的数据块上进行乘法运算**，跳过所有空白区域 ,从而提高利用率
+
+##### Fintuning
+
+MoE的微调比较困难, 因为多专家在训练时就已经不好控制 , 一般这种情况下微调考虑微调非MoE 的 MLP or Attention
+
+![image-20260512165014280](./readme.assets/image-20260512165014280.png)
+
+MLA :引入一个**瓶颈层 (Bottleneck)**。如图所示，输入的 $h_t$ 首先被“降维”投影成两个低维的潜在向量（Latent vector）：
+
+- **$c_t^Q$**：用于生成 Query 的潜在向量。
+- **$c_t^{KV}$**：用于生成 Key 和 Value 的潜在向量。
+- 当需要计算注意力时，模型再从缓存中读取这个 $c_t^{KV}$，通过一个线性投影矩阵（“实时解压”），瞬间恢复出各个头的 $k_{t,i}^C$ (Content Key) 和 $v_{t,i}^C$ (Content Value)。
+- 在实际工程实现中，解压 $c_t^{KV}$ 的权重矩阵可以直接与后续 Attention 计算中的投影矩阵吸收合并（Weight Absorption），从而不仅节省了显存，也没有增加太多的计算开销。
+- KV Cache 中实际缓存的是两部分：压缩后的内容向量 **$c_t^{KV}$** , 未经压缩但维度很小的前置 RoPE 向量 **$k_t^R$**。最终在算 Attention 之前，把内容向量和位置向量直接拼接 (concatenate) 在一起。
+
+## GPU,TPU  
+
+![image-20260512204212043](./readme.assets/image-20260512204212043.png)
+
+GPU , 有层次结构的内存 , 一个Block中最好能完成相同的运算(相同指令不同数据) , 而从shared memory 到Global Memory读取数据是很慢的 , 因此GPU的最大问题就是克服数据流动的时间
+GPU**在同一个SM上是SIMT的**
+
+相较于GPU , TPU有着**更大 , 数量更少的矩阵乘法单元** ,GPU计算更灵活 , 因为tensor core更多 , 可以同时计算更多种计算
+
+GPU的线程代价更低 , 切换也很快捷;
+**矩阵乘法在GPU中做了优化 , FLOPS的运算性能远超其他计算类型**<img src="./readme.assets/image-20260512205737863.png" alt="image-20260512205737863" style="zoom:50%;" />
+
+如图 , 我们的计算速度远超 内存传输速度 和 设备并行速度, 因此目前most operation is memory operation![image-20260512205836601](./readme.assets/image-20260512205836601.png)
+目前比较著名的应用是 prefill decode disaggregation (prefill decode 分离) , prefill compute bound , decode memory bound , 因此分离开用专有硬件进行处理
+
+从寄存器到cpu memory , 随着运算量和内存带宽比的增加 , 最终会达到相同吞吐量(运算饱和) , 只要我们内存带宽增加 , 我们就可以提高我们的运算量从而增加利用率![image-20260512210749295](./readme.assets/image-20260512210749295.png)
+
+how to make GPUs go fast ()
+
+1. Control divergence (除了他 ，其他都是memory相关)
+2. Low precision computation (低精度计算 ，减少传输时间(甚至可能使用内存不减反增，但传输时间减少了))
+3.   Operator fusion  （**算子融合**）
+4.   Recomputation （重新计算的时间比读内存短）
+5. Coalescing memory (Tiling **搬运数据** 的时候，要让**相邻的线程去读取相邻的内存地址**）
+6. Tiling （分块）
+
+除了1以外 , 其他方法都是通过 minimize memory movement实现的
+
+##### Control divergence 控制发散
+
+GPU是SIMT的 , 因此**if 语句的两个branch 都要被执行** ,然后根据if else 情况**mask 其中一个**
+
+![image-20260513095653002](./readme.assets/image-20260513095653002.png)
+
+ 实际执行情况如图 , SIMT依次执行不同分支部分 ; 编写程序较为简单 , 但存在**不小的性能浪费** , 因此**少使用if**
+
+##### 低精度
+
+近年来的flops 大幅增长主要来自于两个要素 : 一个是晶体管数量和时钟频率的增加 , 另外一个是**精度的下降**(fp32->fp16->…fp4 ,int8) , 低精度下的计算实际并不容易 , 重点在于我们要弄清楚**哪些部分是可以在低精度下运算的 , 哪些不行**
+
+相同精度下也有很多特别的 , FP16以及 BF16; E4M3的FP8 以及 E5M2 的FP8 , 二者并没有具体的好坏 , 只有在那些场景下的具体使用 d![image-20260513140800415](./readme.assets/image-20260513140800415.png)
+
+
+
+MXFP8 :**Micro-scaling FP8**，可以理解成“**带分块缩放因子的 FP8 量化格式**”
+每个数据值用 **FP8 E4M3** 表示 , 从而得到更大的尾数精度  ; MXFP8 **不是整个 tensor 共用一个 scale**，而是 **每连续 32 个数共用一个 scale factor** , **scale 是 E8M0** ; 即真实值 = FP8(E4M3) 存的值 × 这个 32 元素小块的 scale
+
+普通**矩阵转置**只是把行列交换；但 MXFP8 的 scale 是按“连续 32 个值”的方向绑定的。按行量化时，一个 scale 对应一行里的 32 个连续元素；按列量化时，一个 scale 对应一列里的 32 个连续元素。这两个分块方向不同，所以 **rowwise MXFP8 和 columnwise MXFP8 在数值上不是简单转置关系**，不能直接把量化后的数据和 scale 转置一下就完事，通常要从从 full-precision 数据量化 ;
+NV官方做了一种优化 , 同时保存双向 MXFP8 , 虽然存储上相较于FP16和BF16并没有节省(两个fp8+scale , 体积还大了) , 但 GEMM 能直接吃 FP8/MXFP8，获得 Tensor Core 的吞吐收益 且避免 backward 时做：`反量化 rowwise FP8 -> 转置 -> 重新量化成 columnwise FP8` , 这个流程会有额外 kernel、额外带宽，以及二次量化误差。NVIDIA 的说明也强调，MXFP8 张量及其转置在数值上不等效；需要从高精度输入重新量化，以避免“转置已量化 FP8 tensor”带来的复合量化误差。
+
+MXFP8 训练不是“整个模型都变成 MXFP8”，而是**只把适合低精度 GEMM 的部分临时量化成 MXFP8**，其它部分仍然用 BF16/FP32。 大部分 **linear / GEMM-heavy** 的地方用 MXFP8 ,LayerNorm , Softmax , Add / residual  , Activation function
+
+##### 算子融合（Kernel Fusion）
+
+本质是将多个独立的计算操作（算子）合并到一个单一的 GPU Kernel 中执行，以极大程度地**减少对高带宽内存（HBM）的读写开销**。
+
+
+
+本次计算正常需要用到八次memory传输<img src="./readme.assets/image-20260513164419432.png" alt="image-20260513164419432" style="zoom:33%;" />
+优化一下 :
+左侧前向传播 ; 右图执行反向传播的 Kernel 时，我们**再次从显存读取 `x`**，并在计算单元内部**重新执行一次前向计算**（图右侧灰蓝色的 3 个 Sigmoid 模块）;
+因为我们的计算资源十分廉价 , 相较于memory传输 , 重算一次时间更低 , 从而将memory次数从8降低至5![image-20260513163632616](./readme.assets/image-20260513163632616.png)
+
+#####  memory
+
+global memory采用的是 DRAM  , 采用突发存储 , 因此如果所需的数据在一行上 , 则一次可以取完
+相反 , 如果在一列上 , 则需要取n次 , 效果大幅降低 , 此时如果是取转置 ,效果更好
+
+##### tiling分块
+
+目的就是把tensor移到share memory里面 ，尽可能提高一次读取的利用率![image-20260514165207366](./readme.assets/image-20260514165207366.png)
+
+标准的矩阵乘法会要求多次读取单个元素 ， 这会要求多次反复访问memory ,而**tiling就是把矩阵切割成子矩阵** ， 然后再加载并操作 ；实际上图图中例子 n=4 , t=2 , 加载一个block进share memory里面的读取速度远超 global memory ,时间大大缩短
+
+
+![image-20260514173146282](./readme.assets/image-20260514173146282.png)
+tiling也会带来问题， 如图 ，右侧刚刚好多了1列 ，tiling此时把右侧当全0读入 ，显然效果不佳 ，因此tiling需要调整很多部分，从而达到最优
+
+![image-20260514173513664](./readme.assets/image-20260514173513664.png)
+不好的tile也会带来问题 ， 如图就是一个bad tiles, 假设我们在每一行多了一个要读取的元素 ， 导致了要读取的元素拆分在两个sub matux 里面 ，无法合并读取一整个block , 带来了更多的传输量(要读两个block)
+
+一般而言系统会自动帮你优化这些问题 ， 单我们构建的时候也可以做一些调整 ：比如矩阵尽可能接近2^n
+经典案例 ：nanoGPT的vocab size从50257->50304 , speed up了20%+ ， 这也是我们可以考虑的部分
+
+随着矩阵大小N的增加 ，趋势上是可以看成是不断上升 ，但这个性能是不平滑的线 ，这种抖动就是因为上面提到的 ， 分块多余部分(1025->1024+1) , 导致出现这样的波峰或者谷  ， 图中蛮明显的是 ，在**K是32的整数倍后性能比较稳定**
+<img src="./readme.assets/image-20260514175654070.png" alt="image-20260514175654070" style="zoom:50%;" />
+
+##### wave quantization
+
+如图，这种wave quantization（**GPU 波次量化**），出现的原因就是因为对齐出现了问题
+首先 ：矩阵n的szie+1 , 分块tile 的数量从98->120 ； 其次，A100只有108个SM , 120超出了这个范围 ，因此得运算两次，导致性能大幅下跌<img src="./readme.assets/image-20260514180459465.png" alt="image-20260514180459465" style="zoom:50%;" />
+
+### flashattention
+
+公式 ： <img src="./readme.assets/image-20260514183527411.png" alt="image-20260514183527411" style="zoom:50%;" />
+
+flashattention 做了online softmax， 使得不用一次性载入所有数据 ， online softmax允许分块导入数据，一边做softmax 一边normalization
+
+![image-20260514185056538](./readme.assets/image-20260514185056538.png)
+
+标准softmax 计算通常需要**三遍扫描**： 第一遍找最大值 $m=max⁡(x)$ ； 第二遍计算分母 $d=∑e^{x_i−m}$ ；最后再遍历一次计算 $y_i=e^{x_i−m}/d$ ；此时需要存储完整的input , 消耗大量内存和读取时间
+
+Online softmax 通过**两次扫描**同时更新最大值和求和的分母，从而实现流式处理 ； 
+
+# Lectures 6   Kernels   Triton   XLA
+
+GPU 中的Kernel由多个Warps组成 ，Warps中的threads同时进行相同的计算(SIMT)   
+一整个threads blocks同时访问同一个shared memory 而不是HBM , 从而减少数据运输时间
+
+### Triton
+
+warps :调度的基本单位 ， multi thread
+**Thread** ： 一个时钟周期能完成一次计算
+**Block** :复数个warps 组成
+**SM**：block的硬件部分(block将sm抽象成一个block)
+
+Triton是目前编写操作threads blocks的主要方式
+
+Warps :线程束 ，可以理解为blocks的细分抽象 ，Warps中的所有threads都遵循相同的instruction
+**Control divergence**: 不同Warps中的threads需要执行不同的instructions ,当遇到 `if (A) { 指令1 } else { 指令2 }` 这种分支代码时，**如果 Warp 里的 32 个线程有一部分走“指令1”，另一部分走“指令2”，这就叫“发散”。**因为硬件必须保持一致，这时 GPU 只能先让所有线程按顺序执行“指令1”（此时走指令2的线程闲置），然后再重新执行“指令2”（此时走指令1的线程闲置）。
+
+SM 不断运行并切换Warps
+
+- **背景**：当 Warp 去访问 **HBM（高带宽显存）** 读取/写入数据时，相比于 GPU 计算速度，显存是非常慢的，这时候 Warp 就会陷入“阻塞/等待”状态。
+- **解决办法**：SM 上同时存有多个 Warp。当一个 Warp 在苦等显存数据回来时，SM 会**零延迟、零开销**地瞬间切换到另一个 Warp 去执行计算，等原本那个 Warp 的数据读回来了再切回去。
+- **目的**：这完全是为了**掩盖内存延迟**。就像厨师，在做一份菜等水烧开的间隙，赶紧去切另一道菜的材料，不浪费任何时间。
+
+##### share memory bank conflict
+
+share memory就像L1 cache ,速度很快但容量很小 ，如果SM中多个thread同时访问同一个memory block， 就会产生conflict ;
+swizzling可以重排memory从而减少conflict ，只能减少不能完全避免
+
+wave quantization problem :上节课提过 ，SM和thread数量不匹配导致极端情况下SM用不满 ，性能浪费![image-20260518205721890](./readme.assets/image-20260518205721890.png)
+
+Programming model : grid (HBM)->thread block(shared memory)->thrend (registers)
+
+benchmark ：torch.utils.benchmark 可以快速计算运算速度(**warmup** ,然后计算运行时间) warmup可以避免很多惰性载入的组件影响 
+不仅如此 ，测试时还应测试多个尺寸的矩阵(256-8192) ,小尺寸时通常增长性质不明显， 大于一定尺寸后才会展现规律
+
+profiling: torch原生 ，可以给出一些细节
+
+torch.compile :优化函数 ，提高运算速度
+
+计算GELU进行对比 ， 设计好的(F.gelu)函数运行最快(深度优化) ，conpile其次 ， native最慢
+原因 ：每次计算都要launch a kernel , 都要从HBM 读出， 计算后再写入 ，效率很低下，大部分时间浪费在write read上
+内置的GELU则有人写好了一个 CUDAKernel
+compile会把计算优化成一个triton kernel ，因此速度次之(也是single kernel)
+
+#### what is Triton
+
+介于cuda和torch之间 ， 以线程块为操作单位
+以下是一段triton代码 ， 编写一个简单的核函数gelu
+
+```python
+import triton.language as tl
+def triton_gelu(x: torch.Tensor):
+    # Check input
+    assert x.is_cuda
+    assert x.is_contiguous()
+
+    # Allocate output tensor
+    y = torch.empty_like(x)
+
+    # Determine grid (elements divided into blocks)
+    # | T T T T T T T T | T T T T T T T T | T T T T T T T T | T T T T T T T T |
+    # |    Block 0      |    Block 1      |     Block 2      |    Block 3     |
+    num_elements = x.numel()  # @inspect num_elements
+    BLOCK_SIZE = 1024  # Number of threads
+    num_blocks = triton.cdiv(num_elements, BLOCK_SIZE)  # @inspect num_blocks
+
+    # Launch the kernel
+    kernel = triton_gelu_kernel[(num_blocks,)](x, y, num_elements, BLOCK_SIZE=BLOCK_SIZE)
+
+    # Write out PTX (look at this later)
+    output_ptx("triton_gelu", kernel)  # @stepover
+
+    return y
+
+
+@triton.jit
+def triton_gelu_kernel(x_ptr, y_ptr, num_elements, BLOCK_SIZE: tl.constexpr):
+    # Input starts at `x_ptr`
+    # Output starts at `y_ptr`
+
+    # | T T T T T T T T | T T T T T T T T | T T T T T T T T | T T T T T T T T |
+    # |    Block 0      |    Block 1      |     Block 2      |    Block 3     |
+
+    pid = tl.program_id(axis=0)      # 识别 block
+    start = pid * BLOCK_SIZE         # Starting index of this block(初始指针偏移量)
+
+    # 各个block的初始偏移
+    offsets = start + tl.arange(0, BLOCK_SIZE)
+
+    # Don't read/write past the end of the tensor(超出num_elements的mask为false)
+    mask = offsets < num_elements
+
+    # Read(from HBM)
+    x = tl.load(x_ptr + offsets, mask=mask)
+
+    # Approx gelu is 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    # Compute (tl.tanh doesn't exist, use tanh(a) = (exp(2a) - 1) / (exp(2a) + 1)
+    a = 0.79788456 * (x + 0.044715 * x * x * x)
+    exp = tl.exp(2 * a)
+    tanh = (exp - 1) / (exp + 1)
+    y = 0.5 * x * (1 + tanh)
+
+    # Store(to HBM)
+    tl.store(y_ptr + offsets, y, mask=mask)
+```
+
+更底层的计算可以看PTX ,有点类似汇编 ， 一般来说不会直接手写
+
+##### Matmul kerenl
+
+矩阵乘法是最常见的计算，A*B=C ，其中`A:m*k B:k*n ,C:m*n` 如果我们按行读取，则至少需要`m*n*k`次读取
+
+ <img src="./readme.assets/image-20260526144203570.png" alt="image-20260526144203570" style="zoom:50%;" />
+如图,我们希望能减少读取次数, 从而提高效率(比如计算c4-c6时,将a4-a6放在share memory中)
+![image-20260526145450033](./readme.assets/image-20260526145450033.png)
+
+如图,通过将结果进行分块 ,我们可以分块矩阵求和的方式得到矩阵乘法的结果(这就是刚刚我们求的简单求和的结果)
+通过tiling的方式 ,如果sm足够大 ,那读取次数可以优化到接近O(N)级别
+
+
+
+# Lecture 7  Parallelism
+
+tensor Parallelism , pipeline Parallelism
+
+L6主要在讲单个GPU内的计算，因此HBM算作慢速存储 ， 本节主要讲multi GPU间的运算
+
+Generalized hierarchy: 以下四个层级传输速率依次递减
+
+- Single node, single GPU: L1 cache / shared memory (fastest)
+- Single node, single GPU: HBM
+- Single node, multi-GPU: NVLink/NVSwitch
+- Multi-node, multi-GPU: Infiniband/Ethernet (slowest)
+
+why multi-GPU：
+
+1. scaling 导致单个GPU显存放不下
+2. 加快运算速度 train faster 
+
+## building blocks of distributed communication/computation
+
+### collective operations 
+
+并行计算时 多个设备间，使用一种指定的通信模式，其中：
+RANK:单独的一个设备
+world size：总设备数
+
+Operations:( 定义的原子操作，这些操作都会将部分计算或者数据转移到其他设备上)
+
+- Broadcast,scatter,gather,reduce (foundations) 
+- All-gather,reduce-scatter,all-reduce (workhorse) 
+- All-to-all (important for MoEs) 
+
+###### Broadcast
+
+copy tensor from rank0 to all ranks
+
+###### scatter
+
+```python
+#input
+rank0=[0,1,2,3]
+
+#output
+rank0=[0]
+rank1=[1]
+rank2=[2]
+rank3=[3]
+```
+
+拆分成和rank相同的份数，然后到每一个rank上
+
+###### gather
+
+```python
+#input
+rank0=[0]
+rank1=[1]
+rank2=[2]
+rank3=[3]
+
+#output
+rank0=[0,1,2,3]
+```
+
+opposite of scatter , gather to one rank
+
+
+
+###### Reduce
+
+apply operation
+
+```python
+#input
+rank0=[0]
+rank1=[1]
+rank2=[2]
+rank3=[3]
+
+#output
+rank0=[6] #sum of ranks
+```
+
+
+
+###### All-gather
+
+```python
+#input
+rank0=[0]
+rank1=[1]
+rank2=[2]
+rank3=[3]
+
+#output
+rank0=[0,1,2,3]
+rank1=[0,1,2,3]
+rank2=[0,1,2,3]
+rank3=[0,1,2,3]
+```
+
+gather to all rank 
+Use case: each rank holds parameter shard, gather to **get full parameters** for forward pass
+
+###### reduce-scatter
+
+```python
+#output
+rank0=[0,1,2,3]
+rank1=[1,2,3,4]
+rank2=[0,1,2,3]
+rank3=[0,2,3,0]
+
+#output
+rank0=[6] #sum
+rank1=[10]
+rank2=[6]
+rank3=[5]
+```
+
+对于每个rank做相同操作
+
+
+
+all-reduce=reduce-scatter +all-gather
+
+```python
+#output
+rank0=[0,1,2,3]
+rank1=[1,2,3,4]
+rank2=[0,1,2,3]
+rank3=[0,2,3,0]
+
+#output
+rank0=[6,10,6,5] #sum
+rank1=[6,10,6,5]
+rank2=[6,10,6,5]
+rank3=[6,10,6,5]
+```
+
+use case  : after backward pass, sum gardients from different data shards, but replicate full parameters
+
+###### all-to-all
+
+each rank send each other rank tensors(最通用)
+
+```python
+# Input
+rank0 = tensor([0., 1, 2, 3])       # send  0 to rank 0,  1 to rank 1,  2 to rank 2,  3 to rank 3
+rank1 = tensor([4., 5, 6, 7])       # send  4 to rank 0,  5 to rank 1,  6 to rank 2,  7 to rank 3
+rank2 = tensor([8., 9, 10, 11])     # send  8 to rank 0,  9 to rank 1, 10 to rank 2, 11 to rank 3
+rank3 = tensor([12., 13, 14, 15])   # send 12 to rank 0, 13 to rank 1, 14 to rank 2, 15 to rank 3
+
+# Output
+rank0 = tensor([0, 4, 8, 12])
+rank1 = tensor([1, 5, 9, 13])
+rank2 = tensor([2, 6, 10, 14])
+rank3 = tensor([3, 7, 11, 15])
+```
+
+上面的代码通过巧妙的send数据 ，实现了矩阵转置 T 
+MoE：each rank have split of data and subset of experts;need to route data to experts
+
+
+
+## Part 2:distributed training
+
+![image-20260526213512968](./readme.assets/image-20260526213512968.png)
+GPU通过NVswitch连接，然后再通过ethernet连接
+如果使用Infiniband , 则直接通过PCIE到Infiniband ，不使用nvlink
+
+bypass CPU：数据流通绕过CPU很重要 ， 传统的Ethernet数据要经过cpu kernel，速率大幅下降；
+上述技术都是R(remote)DMA的 ，直接读写GPU’s memory
+
+### NCCL（NICL）NVIDIA Collective Communicatrion Library
+
+translate collective operation to low level packets between GPUs
+translate collective -> GPU kernels send/receive data
+
+normally, multiprocessing.spawn会帮助调用多线程
+`dist.barrier()` :同步等待，但是会导致计算时间浪费
+以下是一个all-reduce的示例
+
+```python
+    ### All-reduce (dist = torch.distributed)
+    dist.barrier()  # Waits for all processes to get to this point (in this case, for print statements)
+
+    data = tensor([0., 1, 2, 3], device=cuda_if_available(rank)) + rank  # Both input and output
+
+    print(f"Rank {rank} [before all-reduce]: {data}", flush=True)
+    dist.all_reduce(tensor=data, op=dist.ReduceOp.SUM, async_op=False)  # Modifies tensor in place
+#async_op=False是为了统一输出格式
+    print(f"Rank {rank} [after all-reduce]: {data}", flush=True)
+```
+
+  
+
+
+
+#### data Parallelism
+
+数据间做并行，模型完整保存在each rank上  
+训练时大部分和非并行一致，只有最后求梯度时需要做all-reduce
+ddp设计只对反向传播的梯度做平均，因此不影响各个参数做反向梯度求导
+
+### tensor Parallelism
+
+  <img src="./readme.assets/image-20260527184506029.png" alt="image-20260527184506029" style="zoom:25%;" /> 
+
+如上图所示，每个rank负责layer的一部分，当然这样子会导致more data transfer 
+
+```python
+x = data
+    for layer in range(num_layers):
+        # Compute activations (batch_size x local_num_dim)
+        x = x @ params[layer]  # Note: this is only on a slice of the parameters
+        x = F.gelu(x)
+
+        # Allocate memory for activations (world_size x batch_size x local_num_dim)
+        activations = [torch.empty(batch_size, local_num_dim, device=cuda_if_available(rank)) for _ in range(world_size)]
+
+        # Send activations via all gather
+        dist.all_gather(tensor_list=activations, tensor=x, async_op=False)
+
+        # Concatenate them to get batch_size x num_dim
+        x = torch.cat(activations, dim=1)
+
+    print(f"[tensor_parallelism] Rank {rank}: forward pass produced activations {summarize_tensor(x)}", flush=True)  # @stepover
+
+```
+
+通过将大的矩阵乘法拆成小的，然后再all_gather拼接汇总结果
+
+### pipeline Parallelism
+
+按layers拆分network,但是如果不同rank之间计算时间不相等，则会产生pipeline bubble,降低计算效率
+
+sequence Parallelism :拆分sequence,使得attention计算并行
+expert Parallelism:MoE expert
+
+# Lec08-Parallelism：并行训练优化、MoE 扩展与系统瓶颈
+
+GPU在网络拓扑上是全连接的，这意味着GPU的扩展在到达一定数量级后变得更加困难
+早期TPU采用类似环形网络的架构，因此增加rank的开销是线性的
+
+当然上面的两种拓扑结构也决定了GPU更适合MoE(expert不可预测)，TPU更适合Dense model (运算顺序易预测，因此性能损失小)
+
+当然现在TPU也开始做全连接，因为MoE become popular
+
+如果大量使用SRAM,并且增加芯片数量，则可以在单chip性能较低的基础上做到相近甚至更高性能—>Ascend 910
+
+how to parallelism LLMs
+
+data Parallelism ：naive data parallel ; ZeRO 1/2/3
+Model Parallelism  :tensor Parallelism ; pipeline Parallelism
+Activatation parallelism : Sequence parallel 
+
+### data Parallelism ：
+
+#### naive data parallel 
+
+each rank have full model and part of data , so can’t save memory ,and translate gradient nearly 2 times(send/receive)
+
+在一个step中显存占用情况:(using adam)
+```
+2字节用于 FP/BF 16 模型参数
+2字节用于 FP/BF 16 梯度
+4字节用于 FP32 主权重（即 SGD 中累加的内容） #optimizer state
+4（或 2）字节用于 FP32/BF16 Adam 一阶矩估计 #optimizer state
+4（或 2）字节用于 FP32/BF16 Adam 二阶矩估计 #optimizer state
+```
+
+ optimizer 占用了绝大部分的显存，因此我们可以优化这部分(尤其是在并行时)
+
+![image-20260528211507555](./readme.assets/image-20260528211507555.png)
+如图所示，我们可以通过拆分optimizer state，gradient 甚至是 parameters , 从而极大降低显存消耗量(当然传输时间自然会增加，但实际上很多transfer其实是for free的)
+
+####  ZeRO 1/2/3
+
+#### ZeRO 1
+
+![image-20260528213620891](./readme.assets/image-20260528213620891.png)
+
+step1 :每部分参数和gradient 完全保存 ，计算
+step2 : reduce-Scatter gradient后，each get 自己负责的 gradient
+step3: updates part
+step4:all-Gather parameters
+
+传输相较于naive DDP ，数据传输次数从 One all-reduce –>One reduce scatter (send  gradients) + all gather  (collect params) 而 all gather  +reduce scatter 合起来约等于all-reduce，因此性能不变
+,而Memory 从 `(4+K)  * params –> (4+K/Ngpu) * params`，大大减少
+
+#### ZeRO 2
+
+同时还要拆分 gradient，做法如下![image-20260528220109470](./readme.assets/image-20260528220109470.png)Stage 2 optimizer state + gradient state , 反向传播中逐层通信，梯度无需全量存储
+
+### ZeRO 3 FSDP
+
+Model Parameter也做切分，所有rank共同协作，只储存一份完整 Model States
+
+![image-20260529152907152](./readme.assets/image-20260529152907152.png)
+
+1.运算后立即释放参数
+
+2.computation 和 communication 并行，从而使得 communication的开销比理论上低
+all-gather layer1以后开始layer1的compute，同时all-gather layer2
+
+
+
+
+
+Compute scaling
+![image-20260529160342638](./readme.assets/image-20260529160342638.png)
+计算也会有scaling , batch size叫小时，由于噪声影响，增加batch能有效降低噪声，此时rank数和训练速度成线性相关；
+但noise占比较小后，增加batch不再能线性提高训练速度了，此时到达 critical batch size(临界batch size)
+
+### Model Parallelism
+
+####   tensor Parallelism 
+
+cut up matrices 
+
+####  pipeline Parallelism
+
+communicate activation back and forth(传递激活值)
+
+如果我们只做naive的layer cut,就会导致下述状态，pipeline完全不能并行运行，出现很多bubblej![image-20260529161542223](./readme.assets/image-20260529161542223.png)
+
+增大batch size 则可以减少bubble的占比，![image-20260529165026196](./readme.assets/image-20260529165026196.png)
 
 PP(pipeline parallel)
 
