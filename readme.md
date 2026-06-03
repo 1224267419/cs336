@@ -563,3 +563,88 @@ vocabulary size 词表大小
 Weight decay不仅仅是normalize 手段 , 还会和optimizer 交互 , 使得optimization更好 ; 因此
 Weight decay实际上是一种 optimization intervention ,not only normalization intervention ; 证据如下图所示
 ![image-20260508215848722](./readme.assets/image-20260508215848722.png)
+
+PP(pipeline parallel)
+
+FSDP通常更简单,适合在模型较小时优先尝试;PP(pipeline parallel) 常用于超大模型,多节点训练时
+
+NV关于Metatron的论文:如果batch_size太小,pipeline parallel的利用率会很低;
+为了PP维持高利用率,则需要更大的batch size
+
+#### ![image-20260603131531954](./readme.assets/image-20260603131531954.png)
+
+
+
+和FSDP( **Fully Sharded Data Parallel** , 比如刚刚的ZeRO1/2/3)比,pipeline parallel 的传输数据量少的多(不用传参数矩阵),
+
+因此如果能通过优化pipeline parallel 的pipeline communicate cost, cut up 不同layers 做不同安排,从而在backward间穿插forward,减少bubble 提高利用率(下图来自deepseek)![image-20260603132329702](./readme.assets/image-20260603132329702.png)
+
+
+
+进一步优化:backwards拆分成b(backward)和w(weight gradients) ; 
+b用于传递到再下一层进行进一步计算,因此需要优先计算;
+而w仅用于本层参数优化(当前layer的导数),因此可以放在b后计算
+![image-20260603132653935](./readme.assets/image-20260603132653935.png)
+
+分块矩阵计算原生支持切分(大的矩阵计算切成多个小的),就像tiling一样通过分块 ; 
+因此model在wide上做cut up的运算也很常见
+
+### Tensor parallel
+
+如图,以下是一个MLP的demo
+将parameter拆分成两份,正向传播时X copy 2份,同时进入$$A_1$$ $$A_2$$
+在所给demo中,f和g中不同过程中的函数不同(为了计算同步)
+![image-20260603140213570](./readme.assets/image-20260603140213570.png)![image-20260603140718416](./readme.assets/image-20260603140718416.png)
+
+对比我们可以看出tensor parallel 在不同参数矩阵中有着不同的cut up way;
+Columnwise - QKV , up-projection
+Rowwise – Attention output, down-projection
+Replicated – norms, routers, etc (这些非liner是不用做copy和cut up的)
+
+
+
+以下数据基于8GPUs一个 node做的实验
+显然当tensor parallel 超出single node 时,性能会暴跌,因此最好控制在single node中
+![image-20260603141554483](./readme.assets/image-20260603141554483.png)
+
+Tensor parallel 和 pipeline parallel 对比
+
+优点
+
+1. no bubble; no waiting
+2. Low complexity
+3. No need large batch
+
+缺点
+
+1. Cons — much larger communication than pipeline parallel.更多communication
+2. 8bsh * ((n_devices - 1) / n_devices) per layer +all-reduce , 还要做all2all communicate , 传输开销超大 
+
+如图,在运算过程中,存在很多dynamic memory cost , 如果能去掉那些高点的波峰,那我们就可以降低最大memory需求,![image-20260603143618863](./readme.assets/image-20260603143618863.png)
+
+
+
+如下图,随着model scaling, activation 的占比远超 parameters的占比,因此我们需要考虑减少activation部分,而不是只考虑parameters![image-20260603144232152](./readme.assets/image-20260603144232152.png)
+
+经验公式: 
+
+$$\text{Activations memory per layer} = sbh\left(34 + 5\frac{as}{h}\right).$$ 
+其中参数指代如图<img src="./readme.assets/image-20260603144658570.png" alt="image-20260603144658570" style="zoom:50%;" />
+sbh这个值是transformer forward部分的基本单位,后续会经常见到
+5as/h这部分来自quadratic attention的dropout部分,如果用flash attention就没有这些东西
+
+##### Activation under tensor parallel
+
+$$\text{Activations memory per layer} = sbh\left(10 + \frac{24}{t} + 5\frac{as}{ht}\right)$$
+和上面的activation memory对比,大幅减少了;(大部分都/t)The remaining 10 term is for the LayerNorm (4sbh), Dropout (2sbh), and inputs to the attention and MLP (4sbh). These terms alone will continue to grow with size
+
+
+
+##### Sequence Parallel 
+
+![image-20260603151616634](readme.assets/image-20260603151616634.png)Tensor Parallel 区域：
+Self Attention、Linear、GeLU、Linear
+
+Sequence Parallel 区域：
+LayerNorm、Dropout、residual add 相关部分
+
