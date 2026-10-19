@@ -1452,11 +1452,11 @@ Compute scaling
 
 ### Model Parallelism
 
-####   tensor Parallelism 
+###   tensor Parallelism 
 
 cut up matrices 
 
-####  pipeline Parallelism
+### pipeline Parallelism
 
 communicate activation back and forth(传递激活值)
 
@@ -1530,21 +1530,723 @@ Tensor parallel 和 pipeline parallel 对比
 
 $$\text{Activations memory per layer} = sbh\left(34 + 5\frac{as}{h}\right).$$ 
 其中参数指代如图<img src="./readme.assets/image-20260603144658570.png" alt="image-20260603144658570" style="zoom:50%;" />
-sbh这个值是transformer forward部分的基本单位,后续会经常见到
+一个激活张量通常可以记成[s,b,h] , 
 5as/h这部分来自quadratic attention的dropout部分,如果用flash attention就没有这些东西
 
-##### Activation under tensor parallel
+### Activation under tensor parallel
 
 $$\text{Activations memory per layer} = sbh\left(10 + \frac{24}{t} + 5\frac{as}{ht}\right)$$
 和上面的activation memory对比,大幅减少了;(大部分都/t)The remaining 10 term is for the LayerNorm (4sbh), Dropout (2sbh), and inputs to the attention and MLP (4sbh). These terms alone will continue to grow with size
 
 
 
-##### Sequence Parallel 
+### Sequence Parallel 
 
-![image-20260603151616634](readme.assets/image-20260603151616634.png)Tensor Parallel 区域：
-Self Attention、Linear、GeLU、Linear
+![image-20260603151616634](readme.assets/image-20260603151616634.png)
+传统 Tensor Parallel 主要是沿着 **hidden 维度 h** 切分矩阵乘法，比如 Attention 里的 Linear、MLP 里的 Linear。
+但也有很多layer其实并不需要跨 token 通信 , 如residual add ， GeLU ，LayerNorm，Dropout ，这些操作都可以独立处理，不用看别的token,因此LayerNorm / Dropout 这些层可以沿着 sequence 维度切分。
+图片中Tensor Parallel部分主要是矩阵乘法运算
 
-Sequence Parallel 区域：
-LayerNorm、Dropout、residual add 相关部分
+前向传播
 
+$ g 和 \bar g$ :数据处于 Sequence Parallel 状态时，每张 GPU 只有一部分 sequence。但是进入 Tensor Parallel 的 Attention 或 MLP 之前，可能需要把 sequence 重新拼完整，所以需要：g =all-gather ,$\bar g$=reduce-scatter ; 反向传播时则反过来，不赘述
+
+Sequence Parallel 的目标是：让这些 activation 也随着 GPU 数量线性切分。也就是说，GPU 数量翻倍，每张 GPU 上这部分显存接近减半。
+
+下面是采用的配置以及对应的action memory，我们的parallal减少的内存总归有一个下限，即$sbh\left(\frac{34}{t}\right)$
+
+| Configuration                                                | Activations Memory Per Transformer Layer             |
+| ------------------------------------------------------------ | ---------------------------------------------------- |
+| no parallelism                                               | $sbh\left(34 + 5\frac{as}{h}\right)$                 |
+| tensor parallel (baseline)                                   | $sbh\left(10 + \frac{24}{t} + 5\frac{as}{ht}\right)$ |
+| tensor + sequence parallel                                   | $sbh\left(\frac{34}{t} + 5\frac{as}{ht}\right)$      |
+| tensor parallel + selective activation recomputation         | $sbh\left(10 + \frac{24}{t}\right)$                  |
+| tensor parallel + sequence parallel + selective activation recomputation | $sbh\left(\frac{34}{t}\right)$                       |
+
+### expert  parallelism
+
+其实类似于 tensor parallelism ， 只是把expert的FFN部分拆分到不同的device上(Tensor parallel是矩阵拆分，上面讲了如何计算)
+
+因此我们不需要将expert再做拆分放到不同设备上，直接做ep效率更高(GPU做大矩阵运算的利用率比小矩阵更高)
+
+EP相较于TP的优势：
+
+1. EP 可以让每张 GPU 上的本地矩阵乘法更大，因此 GPU 利用率更高
+
+2. 对于 MoE 层，EP 的通信开销通常比 TP 更低。
+
+3. EP 的计算图更简单，更容易把通信和计算重叠。
+
+4. When EP = num_experts, local token permutation is eliminated(当每个 expert 都有自己的并行 rank 时，token 到 expert 的映射更直接，局部 permutation 开销更少 , 例子如下
+
+   $[token3,token9,token12]→Expert0$
+   $[token1,token7,token20]→Expert1$
+
+DDP和DeepEP这两个库做了expert routing and dispatching ，可以大概看看
+
+
+
+
+**Attention 层和 MoE Expert/MLP 层想要的并行方式不一样，所以最好把它们的并行配置解耦。**![image-20260603211645930](./readme.assets/image-20260603211645930.png)
+
+Attention 主要计算包括
+
+1. QKV projection
+2. attention score
+3. softmax
+4. attention output projection
+
+因此更适合TP和CP(context Parallel)
+
+而MoE更适合EP
+
+为了折中，Megatron 提出了解决办法：MoE Parallel Folding
+
+| 部分             | 并行维度            |
+| ---------------- | ------------------- |
+| Attention Layers | TP × CP × DP × PP   |
+| MoE Layers       | ETP × EP × EDP × PP |
+
+**MoE 只作用在 MLP 层，不作用在 Attention 层，所以 Attention 和 MoE-MLP 的最佳并行策略不同。Attention 更需要 TP/CP，MoE-MLP 更需要 EP、较低 TP。为了解决这个不匹配，Megatron 采用 MoE Parallel Folding，把 Attention 的 TP/CP/DP 和 MoE 的 ETP/EP/EDP 分开配置。**
+**不要让 Attention 和 Expert Layer 被迫使用同一套并行配置；它们应该有各自最适合的 parallel group。**
+
+
+
+
+
+### Context Parallel (ring attention)
+
+通常用于**扩展长上下文**
+
+也就是把一个很长的 sequence 沿着 token 维度切到多张 GPU 上，让每张 GPU 只保存一段 token 的 activation，从而支持更长上下文。
+FFN不依赖其他token,因此这样计算不影响 
+但是attention就比较麻烦，因为attention score要对比每一个token,要得到所有GPU的K/V， Ring Attention 的核心做法
+
+不要一次性 all-gather 所有 K/V。
+ 而是让 **K/V block 在 GPU 之间像环一样传递**
+
+![image-20260603214711180](./readme.assets/image-20260603214711180.png)
+
+如图，类似TPU那种成环而非全连接的拓扑结构，每次只拿一个 K/V block 来和本地 Q block 做 attention。用分块方式流式计算 attention，只不过 Ring Attention 的 block 分布在不同 GPU 上，从而节省了完整**上下文的 activation**
+
+#### 3D/4D parallelism
+
+把我们上述的并行策略结合起来，从而让GPU计算满载
+
+![image-20260603221221183](./readme.assets/image-20260603221221183.png)
+
+在这些策略下，GPU，各种数据的增长都是可量化的<img src="./readme.assets/image-20260603221300549.png" alt="image-20260603221300549" style="zoom: 25%;" /><img src="./readme.assets/image-20260603221346745.png" alt="image-20260603221346745" style="zoom:25%;" />
+事实证明，TP=8是一个好的选择
+
+而对于batch size,我们可以通过重计算降低显存占用，提高batch size,从而提升资源利用率(做了更多的compute,但是利用率反而更高了![image-20260603221506489](./readme.assets/image-20260603221506489.png)
+
+
+
+Dolma-7B 全程FSDP ：如果model 不太大，full-FSDP实际上是一个不错的选择
+
+DeepSeek V1 :ZeRO stage1+data parallel+tensor parallel +pipeline parallel
+
+DeepSeekV3 :PP(16)+EP(64-way,8nodes)+ZeRO stage1
+8个节点64卡作为一个expert的节点，从而实现高效运算
+
+
+
+# Lec9 scaling law
+
+#### data scaling
+
+直接在大参数模型上调参效率低，通过在小参数模型上测试->推广到大参数模型上显然更合适
+
+基于概率近似正确（PAC）学习框架下的经典泛化误差上界（Generalization Bound），针对有限大小的假设空间H：
+
+有公式 ：$$\epsilon(\hat h)
+\leq
+\underbrace{\min_{h\in H}\epsilon(h)}_{\text{模型能力限制}}
++
+\underbrace{2\sqrt{\frac1m\log\frac{2k}{\delta}}}_{\text{数据不足造成的误差}}$$
+
+$\epsilon(\hat{h})$：当前学习算法输出的假设 $\hat{h}$（例如经验风险最小化器）的**真实风险（泛化误差）**。
+$\min_{h \in H} \epsilon(h)$：假设空间 $H$ 中所有可能假设的最小真实误差，代表了模型的**近似误差（Approximation Error / Bias）**，即假设空间本身的表达能力极限。
+$m$：训练样本的数量（Sample size）。
+$k$：有限假设空间 $H$ 中包含的假设数量（$\vert{}H\vert{} = k$），代表了模型的容量/复杂度。
+$\delta$：置信度参数，意味着该上界以至少 $1 - \delta$ 的概率成立。
+
+因此，如果模型容量 $k$ 很大，你需要成比例增加样本量 $m$（对数级别）才能保证泛化性能，这是最基础的理论 Scaling 关系
+
+通常而言，根据经验参数可以得知，模型性能acc和规模的对数成正相关，如下图
+
+![image-20260813110545537](./readme.assets/image-20260813110545537.png)
+
+#### data mixture
+
+假设input $x_1,x_2 ... x_n$~$N(\mu,\sigma^{2})$，$\hat{\mu} = \frac{\sum_{i} x_i}{n}$,则loss=$\mathbb{E}\left[\left(\hat{\mu}-\mu\right)^2\right]=\frac{\sigma^2}{n}$, 即
+$$
+log(loss)=2log\sigma-logn
+$$
+![image-20260813114353025](./readme.assets/image-20260813114353025.png)
+
+数据混合比例也很重要，相同数据量下，更多样化的数据比例可以降低err
+
+而且根据这个图可以得知，增大数据量不改变截距，因此可以根据小参数模型在不同混合比例下的表现 scaling up
+
+注意，上面说的所有参数不包括Embedding参数(不参与计算，只是查表)
+
+data
+
+![image-20260813223425331](./readme.assets/image-20260813223425331.png)
+
+**高质量数据是有限的**，有时候为了引入多样性，**使用质量稍差的数据，效果会比反复在高质量数据上训练效果更好**
+
+如右图所示，
+**如果计算量很小，例如只能看少量训练样本E，效果最好**，
+**如果计算量变成中等，那么可以扩展到：E+D**  **效果最好**
+**如果计算量很大，则进一步扩展：E+D+C** 效果最好
+
+因此：**模型规模、计算量在 scaling，数据选择策略本身也应该 scaling，而不是所有规模都用同一个固定过滤阈值。**
+
+### MoE
+
+由于MoE,model parameter和activate parameter解耦，因此scaling law同时依赖这两个参数
+
+![image-20260813222742624](./readme.assets/image-20260813222742624.png)
+
+根据右图可以看出，在相同activate parameter下 ，增加MoE model中那些deactivate parameter(即total parameter)仍有助于降低loss
+
+#### batch size
+
+![image-20260813224230611](./readme.assets/image-20260813224230611.png)
+
+如图，在到达 critical batch size之前，增加batch size 都能有助于 training speed；超过以后增大batch size的收益则放缓
+**(主要影响因素从variance转向bias**)
+
+那么怎么推断这个$B_{critic}$，见下图
+![image-20260817163719093](./readme.assets/image-20260817163719093.png)
+
+S即step，E即examples ，中间的式子是固定的，通过它我们来拟合$B_{cridic}$
+
+![image-20260817165420114](./readme.assets/image-20260817165420114.png)
+
+loss target 越小，batch要求越大
+
+#### Learning rate
+
+
+![image-20260817165734974](./readme.assets/image-20260817165734974.png)
+
+如图，随着scale up,需要逐步降低lr
+
+上图为两种思路：
+
+1. 根据low scale 的结果推scale up的
+2. 先规定好参数随 width 应该如何 scaling，然后 tune 一个 base learning rate，模型扩大后$$\eta^*_{\text{base}}\approx2^{-10.5}$$，；μP 的目标就是让这个最佳“基础超参数”在 scale 变化后仍然保持稳定
+
+
+
+### downstream 下游任务
+
+![image-20260817172046539](./readme.assets/image-20260817172046539.png)
+
+如图，pretrain阶段的ppl基本和scale一致，但到了downstream阶段就出现各种问题，而这些问题很可能是pretrain阶段埋下的雷
+
+![image-20260817210708131](./readme.assets/image-20260817210708131.png)
+
+> **fit scaling exponents on small data, small models. Predict rest.**
+>  在小模型、小数据上拟合 scaling law 的指数，然后外推预测剩下的大规模实验。
+
+核心可以理解成下面这个模型：
+
+L(n,m)≈$An^{−α}+Bm^{−β}+C$
+
+其中：
+
+- n：训练数据量
+- m：模型参数量
+- L：test loss / error
+- α：数据规模的 scaling exponent
+- β：模型规模的 scaling exponent
+- C：无法通过继续扩大数据、模型消除的误差下限
+- A,B：比例系数
+
+当然后续我们有个更简化的公式，即D=20N ，一个参数大约需要20token来训练(一个常用初始超参)
+
+![image-20260817223940113](./readme.assets/image-20260817223940113.png)
+
+modern model 通常是overtrain的(远超上面提到的D=20N),因为$$\boxed{20\text{ tokens/param 是“固定训练算力下的最优点”}}$$，但现代 LLM 厂商真正关心的不只是训练成本，模型发布以后，每生成一个 token，推理成本大体和规模相关，因此overtrain会带来更高的收益；
+即 $$\boxed{\text{训练时多花钱，把能力压进一个更小的模型里}}$$
+
+Chinchilla 的意思**不是**：到 20 tokens/parameter 后再训练模型就不会提升。
+而是 ： 如果你还拥有额外训练 compute，那么在那个特定优化设定下，与其继续训练这个模型，不如同时把模型做大，获得更高的训练算力利用效率。
+
+如果为了 training-compute optimal 而把参数量提高很多，比如做成 30B、50B，可能预训练 FLOPs 更有效率，**却会让推理成本、显存和部署难度**大幅增加
+
+# Lec10 inference
+
+衡量快慢的meterics指标
+
+TTFT(Time to first token)
+latency :延迟，token appear for one query
+Throughput : token appear for may queries
+
+### kv cache
+
+attention中$$q_i \text{ 只能和 } k_j,\; j\le i \text{ 做 attention}$$ ，下三角通过mask遮蔽，因此需要重复使用的只有 k,v ，所以需要留存kv cache(计算量仍然是$O(n^2)$ ,但计算次数少了一半)
+
+$$\begin{array}{c|cccc}
+ & k_1 & k_2 & k_3 & k_4\\
+\hline
+q_1 & \checkmark & \times & \times & \times\\
+q_2 & \checkmark & \checkmark & \times & \times\\
+q_3 & \checkmark & \checkmark & \checkmark & \times\\
+q_4 & \checkmark & \checkmark & \checkmark & \checkmark
+\end{array}$$
+
+prefill阶段：B*T 的token进来，求K V
+generate : T=1 , 每次只生成一个token(casual)
+
+MLP中增大batch可以提高利用率(MLP中每个batch用同一个权重矩阵)
+但attention中的权重矩阵共享，QKV各自独立，因此提升没有MLP大但attention中的权重矩阵共享，QKV各自独立，因此提升没有MLP大
+
+增大batch 通常能提高利用率和Throughput，但也会导致latency 增大(等待每个batch处理完，且读取的kv cache变多) ,
+ 到达极限后再增大就无效了
+
+关于MHA,GQA和MQA的 研究：
+
+
+
+![image-20260819170815979](./readme.assets/image-20260819170815979.png)
+
+![image-20260819172052165](./readme.assets/image-20260819172052165.png)
+
+如图，通过MQA降低memory使用后，latency降低且throughput增大，因此这二者并非完全对立(可以同时变好)
+而同时增大batch ， 则可以更大幅度提高throughput
+
+MLA — Multi-head Latent Attention ：deepseek提出 Low-Rank KV Joint Compression，即
+**我既想保留 multi-head 的表达能力，又不想真的缓存所有 head 的 K/V** ， 那么就**把 K 和 V 联合压缩成 latent** ， 然后使用时再还原(当然这里还有还原以及Decoupled RoPE的问题，不展开)
+
+重点： 需要找到model中可以被squeeze的part
+
+### Speculative Sampling / Speculative Decoding（推测采样/推测解码）
+
+用**小模型 预测 大模型的 输出** ，big model critique draft model的概率q 
+具体流程比较复杂，涉及拒绝采样等内容S
+![image-20260819215856909](./readme.assets/image-20260819215856909.png)
+
+#### selective batching
+
+![image-20260819221540138](./readme.assets/image-20260819221540138.png)
+
+训练时正常训练，attention部分正常计算，非attention部分直接拼接，从而减少传输次数
+
+### page attention
+
+ 类似page memory的思路，而且prompt常常会共享system prompt 等前缀，保存kv cache能节省内存开销
+
+
+
+
+
+# Lec11 scaling law2
+
+这个lec主要讲两篇paper
+
+## MiniCPM 2024
+
+**Chinchilla 定律** : **在固定计算预算下，更小的模型 + 更多的训练 token 更优。**
+
+$N∝ D^{0.73}$ 其中N为模型参数量，D为token总数 ，(之前的规律为N≈20D)
+
+### μP to stabilize scaling
+
+目标：随模型宽度、深度自动缩放训练超参数，**让小模型调出来的超参数，在放大模型后仍然大致有效**
+
+先定义$$r=\frac{d_m}{d_{\text{base}}}$$ 宽度放大倍数，在模型扩大r倍后，**embedding、residual、初始化、learning rate、LM head 应该分别怎么跟着缩放。**
+
+![s](./readme.assets/image-20260820200208406.png)
+如图，通过μP可以基本不用调学习率s
+
+batch size的设置：
+
+如图，下面是一个target loss和BS的拟合曲线，可以大致参考(线性关系这个在之前有简单证明过，不解释![image-20260820201404359](./readme.assets/image-20260820201404359.png)
+
+### WSD(warm-up stable decay)  learning rate 
+
+<img src="./readme.assets/image-20260821112832234.png" alt="image-20260821112832234" style="zoom: 50%;" /><img src="./readme.assets/image-20260821113602885.png" alt="image-20260821113602885" style="zoom: 50%;" />
+
+固定的的warmup step,固定一段时间不变，快结束时集中decay;
+图中是 **Warmup + Cosine Annealing**和WSD的对比图，cosine 需要知道训练终点而WSD不需要(可以随时continue train加数据进去)
+而从图中可以看出实际上WSD也没比cosine差多少
+
+## deepseek seq
+
+直接用的 isoflops测算，简单用scaling law去拟合，思路上更简单直接()
+
+![image-20260823160603305](./readme.assets/image-20260823160603305.png)
+
+qwen 2.5 qwen3 也用了类似的方法
+
+## Kimi K2
+
+上面的paper主要集中于 dense model ， 而modern model常用 MoE model , Kimi K2 则focus on MoE  scaling law
+
+![image-20260823161120192](./readme.assets/image-20260823161120192.png)
+
+如图，针对不同程度的 sparsity ，分别观察效果；(一般而言在相同FlOPs下，sparsity 越高则loss越低）但重点在于上面的paper定量的展现了 sparsity和loss的关系
+
+
+
+不同结构的attention对于数据的需求量是接近一致的
+
+![image-20260823162009416](./readme.assets/image-20260823162009416.png)
+
+
+
+关于lr，batchsize 和scaling law 的error ； 这些数据都可以作为参考去尝试，但绝味真理![image-20260823163804876](./readme.assets/image-20260823163804876.png)
+
+
+
+
+
+这也是一个，其中**越大的模型最优lr越小**。**数据量越多最优lr越大**
+右侧则是最优
+![image-20260823165057186](./readme.assets/image-20260823165057186.png)
+
+## optimizers and scale
+
+
+
+这是不同optimizer的效果，Moun目前看来效果好而且耗时也比较理想![image-20260823175149209](./readme.assets/image-20260823175149209.png)
+
+换了optimizer以后又有新的问题，WD和lr等超参数很多时候也要做相应的修改 
+
+![image-20260823175932083](./readme.assets/image-20260823175932083.png)
+
+如图Meum在规模较小时比较理想，大了以后优势不明显![image-20260823180333351](./readme.assets/image-20260823180333351.png)
+
+## Muon optimizer
+
+![image-20260823231101057](./readme.assets/image-20260823231101057.png)
+
+把整个矩阵的梯度当做一整个整体，重新塑造其奇异值，因此专门针对Transformer 里的二维权重矩阵
+
+$B_t$就是之前的动量
+$O_t$把$B_t$变成一个近似$$UV^T$$的矩阵，即$${
+\operatorname{NewtonSchulz5}(B)
+\approx
+UV^T
+}$$ ,而这里的NewtonSchulz5是一个近似优化
+
+ $$B=USV^T$$ 其中：
+
+- U：左奇异向量
+- V：右奇异向量
+- S=Σ：奇异值组成的对角矩阵
+
+比如：$$\Sigma=
+\begin{bmatrix}
+100&0&0\\
+0&2&0\\
+0&0&0.01
+\end{bmatrix}$$说明这个梯度矩阵在三个主要方向上的强度分别是：100,2,0.01 ,差异较大
+之前的SGD会直接更新，导致第三个方向的更新很少，非常不均匀
+
+而Muon希望把S->E，即$O\approx UV^T$ 从而使得优化在各个方向上的程度接近
+
+如果 B 是长方形矩阵，则更准确地叫：semi-orthogonal / polar factor ， 本质是：
+**保留梯度矩阵的主要方向 U,V，但把各方向的奇异值拉到差不多一样。**
+
+因此虽然Moun的单次计算更慢，但梯度下降速度更快，效果更好
+
+# lec12 eval
+
+eval之前先明确一个点：what is **good** ,我们评价的标准是什么
+
+evaluation -> 把抽象的目标(思考更充分，更深入)变具体
+
+### ppl perplexity困惑度
+
+平均token loss (交叉熵)：$$L=-\frac1N\sum_{t=1}^N \log p(x_t|x_{<t})$$
+$$PPL=e^{loss}$$=$$e^{-\frac1N\sum_{t=1}^N \log p(x_t|x_{<t})}$$
+
+假设有K个等概率的token,则L=log K , PPL=K , 因此PPL可以理解为 **有效候选数量**
+PPL对于scaling law比较smooth,用于研究较为合适
+
+
+
+## chat benchmark
+
+对话这类benchmark的指标不太好定义,以bie下是一些方式
+
+1. 多个模型同时输出回复，让human选择哪个answer更优
+2. LLM-as-judge(直接评价不好评，但加上check list(如cot,输出格式，评分标准) 可以明确评估范围，任务更准确 )
+
+## agentic benchmark
+
+比如编写python代码补丁 , 在不修改项目其他内容的前提下完成功能修复
+
+#### Terminals bench
+
+通过终端完成任务:任务明确，环境简单通用
+
+## save-problem
+
+llm安全也有相对应的benchmark
+
+### jailbreak 越狱
+
+llm会被训练成拒绝执行不好的prompt，但可以通过合适的prompt越过安全审核
+
+#### flash eval
+
+使用新的data 来测试(比training set 新)，但timestamps不一定准确，而且这些data以前也出现过
+
+### private eval
+
+私有 benchmark仍然是较高效的方法，注意data不要泄露到外网
+
+# Lec12，13  Data
+
+data is fundamentally a long-tail problem, scales with human effort（不像System，architectures , 人员需求大）
+
+### data sourse
+
+#### crawl
+
+爬虫爬下来，然后清洗html等方式获取
+
+#### wikipedia
+
+general knowledge : 公众维护的wiki，获取大量通用领域的知识
+而且还有部分小众领域的词条，这些知识也并不好获取，有些时候wiki上的answer质量反而更高
+
+#### github
+
+高质量高数量的代码托管，无需多言；
+而且不仅是code, 还有issue ,git history等重要的信息也是值得获取的
+
+#### arxiv
+
+论文的pdf 或 LaTeX ，不过pdf2text是个问题
+
+## data pipeline
+
+去重，混合数据，
+
+### pretrain
+
+##### 数据转换 transformation
+
+html,pdf， code respository -> text
+
+网页：标准的模板样式，image , tables 等转换成text (简单的table可以转成markdown，但复杂的不太好处理)
+
+PDF: FinePDFs ：hf出的一个处理pdf的工具，需要调用OCR，开销比上面处理Html用的规则脚本更难，但PDF的价值一般比普通网页更高(花心思去做PDF排版，一般不会太差)
+
+### filtering 过滤
+
+如图，filtering 过滤： 在 raw data中提取出和target 相似的 T’ (比如优质数据，语言相同，或者筛选有害数据）![image-20260827222828484](./readme.assets/image-20260827222828484.png)
+
+通常而言，根据T和R构建一个model，然后根据这个model来筛选保留 T’
+这个model可以是一个classifier(FastText),也可以是一个generative model (KenLM , GPT-3 ， LLaMA…)
+
+**一般而言：短时间的训练要求高质量数据(less data)，长时间训练可以容忍较低质量的数据(more data)**
+如图 中蓝色和紫色折线所示，可以很清楚地观察到loss 和token trained 的关联(高质量数据一开始效果更好，但后续数据量不够导致过拟合) 虚线是指数据训练完成一个epoch时使用的train token![image-20260830172058344](./readme.assets/image-20260830172058344.png)
+
+### deduplication去重
+
+精确去重相对简单：hash等映射函数对比即可，很常见且实现简单，不赘述；完全重复的文本直接删掉，
+但Near duplicates近似重复的去重才是重点
+
+### 模糊去重Near duplicates
+
+```text
+A:
+I left for California in 1979,
+and tracked Cleveland's changes on trips back.
+
+B:
+I left for California in 1979,
+and tracked Cleveland's changes on trips back to visit my sister.
+```
+
+比如上面两句话，A不严格等于B,但二者近乎一个意思，相近度极高，而高相似度意味着人为提高了权重，这显然不符合我们的需求，且浪费了大量算力
+还有就是**training val test 之间不应存在重复**，这也是要去重的
+
+![image-20260831234002002](./readme.assets/image-20260831234002002.png)
+
+实际 LLM 数据处理通常使用类似：**MinHash + LSH**  ->MinHash实际上对元素进行复数个哈希函数然后取最小值，然后再在函数结果求交并比(优势：hash计算是线性可并行的)
+
+大概过程是：
+
+```
+document
+   ↓
+切成 n-gram / shingles
+   ↓
+MinHash
+   ↓
+LSH 分桶
+   ↓
+寻找疑似相似文档
+   ↓
+计算 Jaccard similarity(交并比做阈值)
+   ↓
+删除 near duplicates
+```
+
+#### locality sensityve hashing 局部敏感哈希 
+
+上面过程中的LSH分桶(12个hash function , 分三个桶 ， 每个桶4个hash )b=3 , r=4
+
+上面的哈希函数还是可能会有碰撞的可能，导致部分非近似内容被误判，因此我们需要再做一下筛选
+分桶我们可以设计阈值函数有 
+
+```python
+def get prob collision(sim,b,r):
+    prob_match sim **r  #Probability that a fixed band matches
+    prob_collision =1-(1-prob_match)**b Probability that some band matches
+    return prob collision
+```
+
+下面例子概率如图，我们可以根据这样一个变化率较大的尖锐的函数来判断相似度(然后设计一个阈值来做判断)
+通常而言，我们可以设`threshold=(1/b)**(1/r)` ，这个threshold就是上面所说的Jaccard similarity的过滤阈值![image-20260901213627964](./readme.assets/image-20260901213627964.png)
+
+### data mixing 数据混合
+
+假设有高质量数据10B, 低质量数据 10T :
+
+方法一：high * 50epoch+low *0.05epoch 这样子高低质量1:1混合的效果
+最好仅仅是浪费训练时间，最差会做高质量数据集上过拟合导致模型崩塌
+
+法2 ：在batch中混合，部分来自高质量部分来自低质量
+
+如图，我们先做小模型上训练不同比例的数据获取loss点，然后根据loss 训练一个 回归模型，
+用这个回归模型来估计loss的点，从而获取最优配比  ![image-20260903164735171](./readme.assets/image-20260903164735171.png)
+
+当然，这种方法不一定奏效
+
+如果训练一个很小的模型，那我们可以考虑尽可能减少low data的比例![image-20260903165912364](./readme.assets/image-20260903165912364.png)
+
+#### simulated epoching
+
+mup那节类似的思想：希望 low scale look like large scale
+
+将data和model parameters 按相同的radio同步scaling low，通过实验来推断scaling up之后的结果
+
+数据混合也有直接给你一大堆数据的，此时可以考虑按 领域—质量做二维分布，然后在用上面的数据处理方式来做相应的步骤
+
+### post-train data
+
+post-train data变的 very task-dependent , 因为需要做某些领域做特化训练
+
+1. define a set of environment
+2. define a set of test / prompt
+3. 3.Collect responses from a strong model/human (teacher)
+
+# Lec14 Mid-Post training
+
+### SFT 
+
+过程和pretrain阶段没什么太大区别，最大的区别来自于**数据上的差异**
+如果pretrain阶段做的足够好，实际上可以帮你逃过很大程度上SFT部分的training
+
+我们通过sft训练模型，可以通过以下三种指标来衡量
+
+chattiness :对话更接近人类的感觉，而不是单纯的文本benchmark
+detalils: 描述更细致，回答更长
+tool use:训练模型实现工具调用，而非所有结果依赖模型输出
+
+图中对model输出做了两个部分的teachIng,但如果数据较少，模型无法从所给的数据中获得泛化的feature，反而会干扰原本学会的能力![image-20260904222328751](./readme.assets/image-20260904222328751.png)
+
+在model不知道的知识上做finetuning,很可能会导致其产生**hallucinate幻觉**![image-20260904221352243](./readme.assets/image-20260904221352243.png)
+
+因此：
+
+1. **You may not want to fine-tune on tail knowledge, even that’s the LM use case** 长尾数据做SFT效果不一定好，可以考虑外部知识库
+2. In principle, ‘RL’ style correctness feedback could help ，类似RL等方式可以避免在未学习过的分布上训练
+3. **LLM 的知识到底如何存储、什么时候能正确提取出来，本身是一个非常复杂的问题。**
+
+也就是说，我们这里的post-training 更倾向于**激发模型原有的能力**，而非在这个阶段注入新的领域知识
+而这样的STF也不需要大量数据，仅需要少量高质量数据即可
+和RL相比，SFT不限制训练数据的分布情况(RL要求分布近似)
+
+现代大模型通常会把SFT直接当做pre-training的一部分(比如放在pretrain的decay阶段）![image-20260904223608804](./readme.assets/image-20260904223608804.png)
+
+
+
+### RLHF
+
+在sft后，model的output已经有了一定结构，输出分布变得较为可用，此时可以考虑进行RLHF
+RLHF的前提是分布已经有了一定正确性，否则随机性较大的分布上做RLHF效果不甚理想
+
+具体做法：rater rates all of the examples，provide the ranking or binary ranking; 然后模型基于ranking进行standard RL , maximize the score of examples on the **reward model**
+reward model：一个回归或者分类器，用于得到分数
+
+PPO，GRPO,DPO
+
+PPO有传统的reward model , base model , cridit model
+GRPO去掉了cridit model , 用组间平均分代替 cridit
+DPO 去掉了reward model ， 把on policy部分删掉，进一步减少显存占用 (最大化good 和 bad 的reward差异)，但是DPO需要有binary-answer，因此在部分问题上不适合拿来直接做优化(比如没有固定路径或目标的非二元问题)
+
+注意：RLVR等训练必然会导致overfit， 因为不改变reward model则肯定会被过拟合，![image-20260909224536467](./readme.assets/image-20260909224536467.png)
+
+### PPO
+
+一个完整的PPO流程图如下 ![image-20260909231901758](./readme.assets/image-20260909231901758.png)
+
+在LLM的RL过程中，PPO实际上是一个multi-step RL 过程，因此训练过程相较于以往常见的RL场景更加复杂，超参数敏感
+
+RL数据筛选：需要题目偶尔(采样k次)能答对(全对-全错 都不适合)，也因此题目通常需要经过SFT(知识 or 格式补充)和post-train 再进RL阶段
+
+#### RL Infra
+
+RL需要同时考虑roll out 的on/off oplicy ,  以及 training-rollouts 切换![image-20260911231229277](./readme.assets/image-20260911231229277.png)
+
+
+
+# Lec15 Multimodal models 多模态模型
+
+目标：omni model :全模态大模型，输入可以同时是语音，视频等
+
+transformer 的input和output都是token，因此输入部分我们要将上面提到的东西转换为token
+
+#### image：
+
+clip:2021年的clip实现了image2token (用image encoder 和 text encoder 之间的tensor相似度(点积 )来做判断,因为这种数据量够多),分类任务
+VIT:把image 切成16*16的小patch，分别送进embedding里面，一个patch出一个token
+SigLIP: binary classification ,**align text 和 image**
+LLaVA:如图，picture通过encoder+MLP映射为token，再输入到LLM中 ![image-20260915143658512](./readme.assets/image-20260915143658512.png)
+
+ 且对于不同的input，可以做不同的处理(单张图片用全局+patch , 多张图片减少 patch , video进一步降低分辨率) ![image-20260915145719660](./readme.assets/image-20260915145719660.png)
+
+#### qwen-vl: 
+
+3-stage training  ![image-20260915152509666](./readme.assets/image-20260915152509666.png)
+
+pretraining:只训练VIT和cross attention部分,类似pre train
+Multi-task :根据任务做训练，类似 post-training部分，比如(VQA,OCR等)
+最后阶段冻结ViT，只训练adapter 和 language model
+
+### qwen3-vl
+
+如图，做了qwen2vl同款的动态分辨率，长上下文(256k), vision-encoder改用SigLIP2 , MRoPE从之前的顺序排列改成交错排列
+(之前：[ttttwwwwhhhh] 现在:[twhtwhtwhtwh])  ; 为video的pic增加了时间戳，便于model理解pic间的关系(之前这部分信息隐含在位置编码中，现在直接以token形式给出)  ![image-20260915153849077](./readme.assets/image-20260915153849077.png)
+
+长上下文训练：
+
+也是通过分stage训练来得到更长的上下文，因此很多时候模型的attention在前1/4或1/2的性能较好，后面部分因为训练少了性能降低  ![image-20260915154848086](./readme.assets/image-20260915154848086.png)
+
+### VQ-VAE
+
+和标准VAE相比，多了中间的VQ量化操作，
+**把复杂的视觉信息变成有限个“可复用的视觉 token”，这样后面的 Transformer 就可以像处理文字 token 一样处理图像。**
+缺点：离散化确实会丢失信息，效果不如想象中的好 
+![image-20260915162945200](./readme.assets/image-20260915162945200.png)
+
+
+
+### PD分离
+
+prefill:类似pretrain中的做法，一次性填充所有的kv cache进入显存开始推理，因此IO密集
+decode: 计算瓶颈，decode loop不用过多描述
+
+因此通过pd分离，使得不同的集群可以使用不同的技术栈来优化计算，减少设备空转时间 ![image-20260915205143321](./readme.assets/image-20260915205143321.png)
